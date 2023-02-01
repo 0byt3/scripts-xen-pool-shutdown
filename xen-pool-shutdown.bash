@@ -19,7 +19,11 @@ is_host_online() {
   ## if no line exists stating "0 receieved" in ping output then the host is online
   local ping_check=` ping -c 3 $chech_host_addr | grep '0 received' `
 
-  if [ -z "$ping_check" ]; then
+  ## just in case ping access is not available test connectivity over HTTPS
+  curl -s -k -f --connect-timeout 2 "https://$check_host_addr" 2>&1 >/dev/null
+  local xapi_retval=$?
+
+  if [ -z "$ping_check" ] || [ $xapi_retval == 0 ]; then
     echo "TRUE"
   else
     echo "FALSE"
@@ -38,8 +42,8 @@ log() {
     echo "Unsupport log level '$1'" >&2
     exit 1
   else
-    local log_level="$1"
   fi
+    local log_level="$1"
 
   ## if the log is an error type then output to stderr as well otherwise log
   if [  -n "` echo "$1" | grep '(emerg|err)' `" ]; then
@@ -74,6 +78,13 @@ shutdown_secondary_hosts() {
     fi
   done
   unset pool_secondary_hosts
+}
+
+wait_hosts_shutdown() {
+  local this_host_addr=` xe host-list hostname=$this_host_name params=address --minimal `
+  local pool_secondary_addr=`xe host-list params=address | awk '$1=="address" && $5!="'$this_host_addr'" {print $5}' `
+
+  
 }
 
 this_host_name=` hostname -s `
