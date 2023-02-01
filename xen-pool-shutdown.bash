@@ -1,38 +1,35 @@
 #!/bin/bash
 
-## timeout in seconds to wait for other hosts to shutdown (only applies if this is the pool's master)
+############################################################################################
+##                                                                                        ##
+##  This script is intended to be run on the pool master and will shutdown all VMs and    ##
+##  hosts in the pool.                                                                    ##
+##                                                                                        ##
+############################################################################################
+
+## timeout in seconds to wait for other hosts to shutdown
 WAIT_ON_HOSTS_TIMEOUT=600
 
+## program name to appear in the logs
 PROGRAM_NAME="xen-shutdown-script"
-
-get_addr_of_hosts() {
-  ## check to make sure host_uuid exists
-  if [ -z "$host_uuid" ]; then
-    echo "Missing host_uuid var. Required by get_addr_of_hosts function." >&2
-    return 1
-  fi
-  local this_host_addr=` xe host-list uuid=$host_uuid params=address | awk '/address/ {print $5}' `
-  for host_addr in ` xe host-list params=address | awk '$5!="'$this_host_addr'" && $1=="address" { print $5 }' `; do
-    echo "$host_addr"
-  done
-
-}
-
-get_vm_name_from_uuid() {
-  xe vm-list uuid=$1 params=name-label | awk '/name-label/ {print $5}'
-}
 
 is_host_online() {
   local chech_host_addr="$1"
 
   ## if no line exists stating "0 receieved" in ping output then the host is online
-  [ -z "` ping -c 3 $chech_host_addr | grep '0 received' `" ] && return 0 || return 1
+  local ping_check=` ping -c 3 $chech_host_addr | grep '0 received' `
+
+  if [ -z "$ping_check" ]; then
+    echo "TRUE"
+  else
+    echo "FALSE"
+  fi
 }
 
 log() {
-  # throw error if there are two arguments
+  # throw error if there are not two arguments
   if [ $# != 2 ]; then
-    echo "The log function requires 2 arguments. Received only $#." >&2
+    echo "The log function takes 2 arguments. Received $#." >&2
     return 1
   fi
 
@@ -52,88 +49,49 @@ log() {
   fi
 }
 
-shutdown_hosts() {
-  for host_addr in ` get_addr_of_hosts `; do
-    if ` is_host_online "$host_addr" `; then
-      xe host-disable address=$host_addr
-      xe host-shutdown address=$host_addr
-      ## if host-shutdown via xapi fails then try over SSH using public key auth
-      [ $? == 0 ] || ssh -o PubkeyAuthentication=yes $host_addr "poweroff"
+shutdown_secondary_hosts() {
+  local pool_secondary_hosts=` xe host-list params=name-label | awk '$1=="name-label" && $5!="'$this_host_uuid'" { print $5 }' `
+
+  for secondary_host_name in "$pool_secondary_hosts"; do
+    log info "Disabling host '$secondary_host_name'"
+    xe host-disable name-label=$secondary_host_name
+    log info "Issuing shutdown to '$secondary_host_name' using xe CLI."
+    local shutdown_result=` xe host-shutdown name-label=$secondary_host_name 2>&1 `
+
+    ## if host-shutdown via xapi fails then try over SSH using public key auth
+    if [ $? != 0 ]; then
+      log error "Error issuing shutdown to host '$secondary_host_name' using xe CLI: $shutdown_result"
+      unset shutdown_result
+      local secondary_host_addr=` xe host-list name-label=$secondary_host_name params=address --minimal `
+      # if ping check succeeds then use ssh to poweroff
+      if [ "` is_host_online "$secondary_host_addr" `" == "TRUE" ]; then
+        log info "Issuing shutdown using ssh and public key authentication."
+        ssh_result=` ssh -o PubkeyAuthentication=yes $secondary_host_addr "poweroff" 2>&1 `
+        [ $? == 0 ] || log error "Error issuing shutdown using ssh: $ssh_result"
+        unset ssh_result
+      fi
+      unset secondary_host_addr
     fi
   done
+  unset pool_secondary_hosts
 }
 
-shutdown_vms() {
+this_host_name=` hostname -s `
 
-  if [ -n "$1" ]; then
-    local xe_host_uuid="$1"
-    local vm_uuids=` xe vm-list resident-on=$xe_host_uuid is-control-domain=false power-state=running params=uuid | awk "\\$1==\\"uuid\\" {print \\$5}" `
-  else
-    local vm_uuids=` xe vm-list is-control-domain=false power-state=running params=uuid | awk "\\$1==\\"uuid\\" {print \\$5}" `
-  fi
-  
-  for vm_uuid in "$vm_uuids"; do
-    local vm_name=`get_vm_name_from_uuid`
-    log info "Issuing shutdown to VM '$vm_uuid' ($vm_name)"
-    xe vm-shutdown uuid=$vm_uuid &
-  done
+## issue shutdown to all VMs still running (not just the VMs on this host)
+vm_shutdown_result=` xe vm-shutdown power-state=running is-control-domain=false --multiple 2>&1 `
+[ $? == 0 ] || log error "Error issuing shutdown to VMs using xe CLI: $vm_shutdown_result"
+unset vm_shutdown_result
 
-  # Wait for VMs to shutdown
-  while [ -n "` jobs | grep vm-shutdown `" ]; do
-    sleep 1s
-  done
-}
+## shutdown hosts
+shutdown_secondary_hosts
 
-## wait for other hosts to shutdown
-wait_on_hosts() {
-  local timeout=$1
-  local loop_count=0
+## disable this host (required in order for shutdown to work)
+vm_shutdown_result=` xe host-disable hostname=$this_host_name 2>&1 `
+[ $? == 0 ] || log error "Error issuing disable to '$this_host_name': $vm_shutdown_result"
+unset vm_shutdown_result
 
-  while true; do
-    local hosts_online="FALSE"
-    for host_addr in ` get_addr_of_hosts `; do
-      
-      if ` is_host_online "$host_addr" `; then
-        local hosts_online="TRUE"
-        break
-      fi
-    done
-    
-    ## if a host is still online then wait 1 second then continue, otherwise break while loop
-    [ "$hosts_online" == "TRUE" ] && sleep 1s || break
-
-    ## if timeout has been reached, break while loop
-    [ $loop_count == $timeout ] && break
-
-    ((loop_count++))
-  done
-
-  ## if did not stop due to timeout stop with code 0, otherwise stop with code 1 (timed out)
-  [ $loop_count != $timeout ] && return 0 || return 1
-}
-
-host_name=` hostname -s `
-host_uuid=` xe host-list hostname=$host_name params=uuid | awk '/uuid/ {print $5}' `
-
-## shutdown VMs on this host
-shutdown_vms "$host_uuid"
-
-## if this is the master then we need to wait for the other hosts to shutdown.
-#   the other hosts won't be able to use xe command if the master is off
-master_uuid=` xe pool-list params=master | awk '/master/ {print $5}' `
-
-if [ "$master_uuid" == "$host_uuid" ]; then
-  # wait for other hosts in the pool to shutdown
-  wait_on_hosts
-
-  ## if hosts are not finished shutting down then take matters into our own hands
-  if [ $? != 0 ]; then
-    ## issue shutdown to all VMs still running (not just the VMs on this host)
-    shutdown_vms
-
-    ## attempt to issue a shutdown command to each host
-
-  fi
-fi
-
-xe host-shutdown hostname=$host_name
+## shutdown this host
+host_shutdown_result=` xe host-shutdown hostname=$this_host_name 2>&1 `
+[ $? == 0 ] || log error "Error issuing shutdown to '$this_host_name': $host_shutdown_result"
+unset shutdown_result
