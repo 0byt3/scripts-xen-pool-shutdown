@@ -41,23 +41,23 @@ log() {
   if [ -z "` echo "$1" | egrep -i '(emerg|alert|crit|err|warning|notice|info|debug)' `" ]; then
     echo "Unsupport log level '$1'" >&2
     return 1
-  else
   fi
-    local log_level="$1"
+  local log_level="$1"
 
   ## if the log is an error type then output to stderr as well, otherwise log
-  msg="[${log_level}] `date '+%Y-%b%d %H:%M:%S'` ${this_hostname} ${2}"
-  echo "${msg}" >> /var/log/xen-pool-shutdown.log
+  msg="[$log_level] `date '+%Y-%b%d %H:%M:%S'` $this_hostname $2"
+  echo "$msg" >> /var/log/xen-pool-shutdown.log
   if [  -n "` echo "$log_level" | grep '(emerg|err)' `" ]; then
     # logger -s -t "$PROGRAM_NAME" -p syslog.$log_level "$2"
-    echo "${msg}" >&2
-  # else
+    echo "$msg" >&2
+  else
+    echo "$msg"
   #   logger -t "$PROGRAM_NAME" -p syslog.$log_level "$2"
   fi
 }
 
 shutdown_secondary_hosts() {
-  local pool_secondary_hosts=` xe host-list params=name-label | awk '$1=="name-label" && $5!="'$this_host_uuid'" { print $5 }' `
+  local pool_secondary_hosts=` xe host-list params=name-label | awk '$1=="name-label" && $5!="'$this_host_name'" { print $5 }' `
 
   for secondary_host_name in "$pool_secondary_hosts"; do
     log info "Disabling host '$secondary_host_name'"
@@ -90,29 +90,32 @@ shutdown_secondary_hosts() {
 
 wait_hosts_shutdown() {
   local this_host_addr=` xe host-list hostname=$this_host_name params=address --minimal `
-  local pool_secondary_addr=`xe host-list params=address | awk '$1=="address" && $5!="'$this_host_addr'" {print $5}' `
+  local pool_secondary_addrs=`xe host-list params=address | awk '$1=="address" && $5!="'$this_host_addr'" {print $5}' `
 
-  local hosts_online="FALSE"
   local timer=0
   while true; do
-
-    for host_addr in "${pool_secondary_addr}"; do
+    local hosts_online="FALSE"
+    echo "loop on hosts to check online status"
+    for host_addr in "${pool_secondary_addrs}"; do
+      echo "checking host ${host_addr}"
+      # [ "` is_host_online "$host_addr" `" == "TRUE" ] && echo "host '$host_addr' is online" && hosts_online="TRUE" && break
       [ "` is_host_online "$host_addr" `" == "TRUE" ] && hosts_online="TRUE" && break
     done
     
-    if [ $timer == $WAIT_ON_HOSTS_TIMEOUT ]; then
+    if [ $timer -eq $WAIT_ON_HOSTS_TIMEOUT ]; then
       log error "Timed out waiting for secondary hosts to shutdown. Waited ${WAIT_ON_HOSTS_TIMEOUT} seconds."
       break
     fi
 
-    [ hosts_online == "FALSE" ] && break || sleep 1s
+    # [ $hosts_online == "FALSE" ] && break || sleep 1s
+    [ $hosts_online == "FALSE" ] && echo "All hosts are offline" && break || sleep 1s
 
     ((timer++))
   done
 
   unset pool_secondary_hosts
   unset this_host_addr
-  [ $timer == $WAIT_ON_HOSTS_TIMEOUT ] || return 1
+  [ $timer -eq $WAIT_ON_HOSTS_TIMEOUT ] || return 1
 }
 
 this_host_name=` hostname -s `
@@ -122,18 +125,20 @@ vm_shutdown_result=` xe vm-shutdown power-state=running is-control-domain=false 
 [ $? == 0 ] || log error "Error issuing shutdown to VMs using xe CLI: $vm_shutdown_result"
 unset vm_shutdown_result
 
-## issue shutdown to secondary hosts
+## instruct secondary hosts to shutdown
 shutdown_secondary_hosts
 
 ## wait for secondary hosts to shutdown
 wait_hosts_shutdown
 
 ## disable this host (required in order for shutdown to work)
+log info "Issuing disable to '$this_host_name'"
 vm_shutdown_result=` xe host-disable hostname=$this_host_name 2>&1 `
-[ $? == 0 ] || log error "Error issuing disable to '$this_host_name': $vm_shutdown_result"
+if [ $? == 0 ] || log error "Error issuing disable to '$this_host_name': $vm_shutdown_result"
 unset vm_shutdown_result
 
 ## shutdown this host
+log info "Issuing shutdown to '$this_host_name'"
 host_shutdown_result=` xe host-shutdown hostname=$this_host_name 2>&1 `
 [ $? == 0 ] || log error "Error issuing shutdown to '$this_host_name': $host_shutdown_result"
 unset shutdown_result
