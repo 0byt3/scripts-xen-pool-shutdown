@@ -57,9 +57,10 @@ log() {
 }
 
 shutdown_secondary_hosts() {
+  ## get a list of secondary hosts in the pool
   local pool_secondary_hosts=` xe host-list params=name-label | awk '$1=="name-label" && $5!="'$this_host_name'" { print $5 }' `
 
-  for secondary_host_name in "$pool_secondary_hosts"; do
+  while read secondary_host_name; do
     log info "Disabling host '$secondary_host_name'"
     xe host-disable name-label=$secondary_host_name
     
@@ -72,7 +73,9 @@ shutdown_secondary_hosts() {
       log error "Error issuing shutdown to host '$secondary_host_name' using xe CLI: $shutdown_result"
       unset shutdown_result
 
+      ## first check if host is online, otherwise don't bother attempting ssh
       local secondary_host_addr=` xe host-list name-label=$secondary_host_name params=address --minimal `
+      echo "secondary_host_addr = $secondary_host_addr"
       # if ping check succeeds then use ssh to poweroff
       if [ "` is_host_online "$secondary_host_addr" `" == "TRUE" ]; then
         log info "Issuing shutdown using ssh and public key authentication."
@@ -84,31 +87,55 @@ shutdown_secondary_hosts() {
 
     fi
 
-  done
+  done <<<"$pool_secondary_hosts"
   unset pool_secondary_hosts
 }
 
+shutdown_vms() {
+  ## check if any VMs are running
+  num_vms_running=`xe vm-list is-control-domain=false power-state=running params=uuid --minimal | sed 's/,/ /g' | wc -w`
+  if [ $num_vms_running -lt 1 ]; then
+    log info "No virtual machines are running. No VM shutdown required."
+    return 0
+  fi
+
+  log info "Shutting down virtual machines."
+  local vm_shutdown_stderr_path="/tmp/$PROGRAM_NAME.vm_shutdown.$RANDOM.stderr"
+  local vm_shutdown_time_result=$( time (xe vm-shutdown power-state=running is-control-domain=false --multiple >/dev/null 2>"$vm_shutdown_stderr_path") 2>&1 )
+  if [ -f "$vm_shutdown_stderr_path" ] && [ -n "`cat "$vm_shutdown_stderr_path"`" ]; then
+    local vm_shutdown_stderr=`cat "$vm_shutdown_stderr_path"`
+    log error "Error issuing shutdown to VMs using xe CLI: $vm_shutdown_stderr"
+    unset vm_shutdown_stderr
+  else
+    local vm_shutdown_time=`echo "$vm_shutdown_time_result" | awk '/real/ {print $2}'`
+    log info "Virtual machine shutdown took $vm_shutdown_time"
+    unset vm_shutdown_time
+  fi
+  # test -f "$vm_shutdown_stderr_path" && rm -f "$vm_shutdown_stderr_path"
+  unset vm_shutdown_stderr_path
+  unset vm_shutdown_time_result
+}
+
 wait_hosts_shutdown() {
+  log info "Waiting for secondary hosts to shutdown"
+
   local this_host_addr=` xe host-list hostname=$this_host_name params=address --minimal `
   local pool_secondary_addrs=`xe host-list params=address | awk '$1=="address" && $5!="'$this_host_addr'" {print $5}' `
 
   local timer=0
   while true; do
     local hosts_online="FALSE"
-    echo "loop on hosts to check online status"
-    for host_addr in "${pool_secondary_addrs}"; do
-      echo "checking host ${host_addr}"
+    while read host_addr; do
       # [ "` is_host_online "$host_addr" `" == "TRUE" ] && echo "host '$host_addr' is online" && hosts_online="TRUE" && break
       [ "` is_host_online "$host_addr" `" == "TRUE" ] && hosts_online="TRUE" && break
-    done
+    done <<<"$pool_secondary_addrs"
     
     if [ $timer -eq $WAIT_ON_HOSTS_TIMEOUT ]; then
       log error "Timed out waiting for secondary hosts to shutdown. Waited ${WAIT_ON_HOSTS_TIMEOUT} seconds."
       break
     fi
 
-    # [ $hosts_online == "FALSE" ] && break || sleep 1s
-    [ $hosts_online == "FALSE" ] && echo "All hosts are offline" && break || sleep 1s
+    [ $hosts_online == "FALSE" ] && log info "All secondary hosts are offline" && break || sleep 1s
 
     ((timer++))
   done
@@ -118,12 +145,10 @@ wait_hosts_shutdown() {
   [ $timer -eq $WAIT_ON_HOSTS_TIMEOUT ] || return 1
 }
 
-this_host_name=` hostname -s `
+this_host_name=` hostname `
 
 ## issue shutdown to all VMs still running (not just the VMs on this host)
-vm_shutdown_result=` xe vm-shutdown power-state=running is-control-domain=false --multiple 2>&1 `
-[ $? == 0 ] || log error "Error issuing shutdown to VMs using xe CLI: $vm_shutdown_result"
-unset vm_shutdown_result
+shutdown_vms
 
 ## instruct secondary hosts to shutdown
 shutdown_secondary_hosts
@@ -134,11 +159,11 @@ wait_hosts_shutdown
 ## disable this host (required in order for shutdown to work)
 log info "Issuing disable to '$this_host_name'"
 vm_shutdown_result=` xe host-disable hostname=$this_host_name 2>&1 `
-if [ $? == 0 ] || log error "Error issuing disable to '$this_host_name': $vm_shutdown_result"
+[ $? == 0 ] || log error "Error issuing disable to '$this_host_name': $vm_shutdown_result"
 unset vm_shutdown_result
 
-## shutdown this host
-log info "Issuing shutdown to '$this_host_name'"
-host_shutdown_result=` xe host-shutdown hostname=$this_host_name 2>&1 `
-[ $? == 0 ] || log error "Error issuing shutdown to '$this_host_name': $host_shutdown_result"
-unset shutdown_result
+# ## shutdown this host
+# log info "Issuing shutdown to '$this_host_name'"
+# host_shutdown_result=` xe host-shutdown hostname=$this_host_name 2>&1 `
+# [ $? == 0 ] || log error "Error issuing shutdown to '$this_host_name': $host_shutdown_result"
+# unset shutdown_result
